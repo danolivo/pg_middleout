@@ -1,0 +1,163 @@
+# Torture-test pg_middleout against a fresh PostgreSQL master.
+#
+# It builds today's PostgreSQL master, installs pg_middleout, preloads it and
+# forces Memoize on for every eligible correlated subplan, then runs the whole
+# installcheck-world suite. Forcing Memoize everywhere intentionally changes a
+# lot of EXPLAIN output, so the suite is *expected* to report many diffs - that
+# is not a failure. The job fails only if the extension introduces a real
+# server error or crash, detected as ERROR/FATAL/PANIC or a lost-connection
+# marker in any *.diffs file.
+
+name: installcheck-world (force memoize)
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+  schedule:
+    # Sunday ~midnight CEST (22:00 UTC Sunday). Adjust to taste.
+    - cron: '0 22 * * 0'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  torture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PG_PREFIX: ${{ github.workspace }}/pgsql
+      PGDATA: ${{ github.workspace }}/pgsql/data
+      PGHOST: /tmp
+      PGPORT: '5432'
+      PGUSER: postgres
+      PGDATABASE: postgres
+
+    steps:
+      - name: Checkout pg_middleout
+        uses: actions/checkout@v4
+        with:
+          path: pg_middleout
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          # Build toolchain + every optional library installcheck-world's
+          # regression/contrib suites can exercise, plus IPC::Run, which the
+          # TAP tests require, and locale data for the collation tests.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex pkg-config gettext \
+            libreadline-dev zlib1g-dev \
+            libssl-dev libldap2-dev libpam0g-dev libkrb5-dev \
+            libicu-dev libxml2-dev libxslt1-dev uuid-dev \
+            liblz4-dev libzstd-dev \
+            libperl-dev perl libipc-run-perl \
+            python3-dev python3 \
+            tcl-dev tcl \
+            locales
+          sudo locale-gen C.UTF-8 en_US.UTF-8 || true
+          # Note: the gated PG_TEST_EXTRA suites (ssl, ldap, kerberos, ...) are
+          # deliberately NOT enabled - they spin up their own clusters (so they
+          # do not exercise our preloaded server) and produce no *.diffs.
+
+      - name: Clone fresh PostgreSQL master
+        run: git clone --depth 1 https://git.postgresql.org/git/postgresql.git postgres
+
+      - name: Drop pg_middleout into contrib
+        run: cp -a pg_middleout postgres/contrib/pg_middleout
+
+      - name: Select build intensity
+        run: |
+          # cassert is always on - it turns malformed plans into clean aborts.
+          # The plan-tree round-trip checks are very slow, so only run them on
+          # the scheduled (Sunday) build; they are the strongest validation of
+          # the hand-built Memoize/Param nodes this extension inserts.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo 'EXTRA_CPPFLAGS=-DWRITE_READ_PARSE_PLAN_TREES -DCOPY_PARSE_PLAN_TREES -DREALLOCATE_BITMAPSETS' >> "$GITHUB_ENV"
+          else
+            echo 'EXTRA_CPPFLAGS=' >> "$GITHUB_ENV"
+          fi
+
+      - name: configure
+        working-directory: postgres
+        run: |
+          ./configure \
+            --prefix="$PG_PREFIX" \
+            --enable-cassert --enable-debug --enable-tap-tests \
+            --with-openssl --with-ldap --with-pam --with-gssapi \
+            --with-icu --with-libxml --with-libxslt --with-uuid=e2fs \
+            --with-lz4 --with-zstd \
+            --with-perl --with-python --with-tcl \
+            CPPFLAGS="$EXTRA_CPPFLAGS"
+
+      - name: Build and install (core + contrib, no docs)
+        working-directory: postgres
+        run: |
+          make -s -j"$(nproc)" world-bin
+          make -s install-world-bin
+          # pg_middleout is not in contrib/Makefile's SUBDIRS, so build/install
+          # it explicitly so it can be preloaded.
+          make -s -C contrib/pg_middleout install
+
+      - name: Initialise and start the instance
+        run: |
+          "$PG_PREFIX/bin/initdb" -D "$PGDATA" -U "$PGUSER" --locale=C --encoding=UTF8
+          cat >> "$PGDATA/postgresql.conf" <<'EOF'
+          unix_socket_directories = '/tmp'
+          listen_addresses = 'localhost'
+          port = 5432
+          lc_messages = 'C'
+          fsync = off
+          shared_preload_libraries = 'pg_middleout'
+          enable_memoize = on
+          pg_middleout.memoize_subplan = on
+          pg_middleout.force_memoize_subplan = on
+          EOF
+          "$PG_PREFIX/bin/pg_ctl" -D "$PGDATA" -l "$PGDATA/server.log" -w start
+
+      - name: Sanity-check that the extension is loaded and forcing Memoize
+        run: |
+          "$PG_PREFIX/bin/psql" -c "SHOW shared_preload_libraries;"
+          "$PG_PREFIX/bin/psql" -c "SHOW pg_middleout.force_memoize_subplan;"
+
+      - name: Run installcheck-world
+        working-directory: postgres
+        # Diffs are expected (forced Memoize rewrites plans), so do not let a
+        # non-zero exit fail the job here - the diff scan below is the verdict.
+        run: make installcheck-world || true
+
+      - name: Fail on ERROR / FATAL / crash in any *.diffs
+        working-directory: postgres
+        run: |
+          echo "Non-empty regression diff files:"
+          find . -name '*.diffs' -size +0c -printf '  %p (%s bytes)\n' || true
+          echo
+          echo "Scanning for server errors and crashes (plan-only diffs are ignored)..."
+          if grep -rInE \
+               '(ERROR|FATAL|PANIC):|server closed the connection unexpectedly|database system is (in recovery|shutting down)|TRAP: failed Assert' \
+               --include='*.diffs' . ; then
+            echo
+            echo "FAILURE: error/crash markers present in regression diffs (shown above)."
+            echo "Forced Memoize introduced a server-visible failure - investigate."
+            exit 1
+          fi
+          echo "PASS: no ERROR/FATAL/PANIC/crash markers in any *.diffs."
+
+      - name: Upload diffs and logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installcheck-world-artifacts
+          path: |
+            postgres/**/*.diffs
+            postgres/**/regression.out
+            postgres/**/log/**
+            ${{ env.PGDATA }}/server.log
+          if-no-files-found: ignore
+
+      - name: Stop the instance
+        if: always()
+        run: |
+          "$PG_PREFIX/bin/pg_ctl" -D "$PGDATA" stop -m immediate || true
